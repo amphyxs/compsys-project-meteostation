@@ -1,7 +1,10 @@
 #include <ESP8266WiFi.h>
 #include <Wire.h>  
 #include <Adafruit_BME280.h>
-#include <math.h> 
+#include <math.h>
+#include <Scheduler.h>
+#include <Task.h>
+#include <LeanTask.h>
 
 static const uint8_t D0 = 16;
 static const uint8_t D1 = 5;
@@ -59,6 +62,110 @@ static inline const char* trendStr(float dP) {
   return "stable";
 }
 
+// Task для чтения BME280 (температура и влажность)
+class BME280Task : public LeanTask {
+public:
+  void loop() {
+    temperature = bme.readTemperature();
+    humidity = bme.readHumidity();
+    Serial.println("BME280 temp/humidity updated");
+    delay(1000); 
+  }
+} bme280_task;
+
+class PressureTask : public Task {
+public:
+  void loop() {
+    Serial.println("Reading pressure...");
+    delay(10000); // задержва 10 с
+    
+    pressure = bme.readPressure() / 100.0F;
+    altitude = bme.readAltitude(SEALEVELPRESSURE_HPA);
+    
+    seaLevelPressure = toSeaLevelPressure(pressure, ELEVATION_M);
+    if (isnan(p0_ema)) p0_ema = seaLevelPressure;
+    p0_ema += ALPHA_P * (seaLevelPressure - p0_ema);
+
+    if (isnan(p0_mark) || (millis() - lastTrendMark) > TREND_WINDOW_MS) {
+      p0_mark = p0_ema;
+      lastTrendMark = millis();
+    }
+    
+    Serial.println("Pressure updated");
+    delay(5000); 
+  }
+} pressure_task;
+
+class LightTask : public LeanTask {
+public:
+  void loop() {
+    light = 1024 - analogRead(lightAnalog);
+    Serial.println("Light sensor updated");
+    delay(500);
+  }
+} light_task;
+
+// Task для чтения датчика дождя
+class RainTask : public LeanTask {
+public:
+  void loop() {
+    rain = digitalRead(rainDigital);
+    isRainy = rain < 1.00;
+    Serial.println("Rain sensor updated");
+    delay(200);
+  }
+} rain_task;
+
+class WeatherTask : public LeanTask {
+public:
+  void loop() {
+    float dP = p0_ema - p0_mark;
+    float Td = dewPointC(temperature, humidity);
+    float spread = temperature - Td;
+
+    if (isRainy) {
+      if (temperature < 0.0f) {
+        weather = (light < LIGHT_NIGHT) ? "Snow (night)" : "Snow";
+      } else {
+        weather = (light < LIGHT_NIGHT) ? "Rain (night)" : "Rain";
+      }
+      if (p0_ema < 1000.0f || dP < -1.0f) weather += " • low pressure";
+    }
+    else if ((humidity >= 95.0f || spread < 2.0f) && light < 600) {
+      weather = "Fog";
+    }
+    else {
+      if (light >= LIGHT_SUNNY && p0_ema >= 1018.0f) {
+        weather = "Sunny";
+      } else if (light >= LIGHT_DAY) {
+        weather = (p0_ema >= 1010.0f ? "Partly cloudy" : "Cloudy");
+      } else if (light < LIGHT_NIGHT) {
+        weather = "Night";
+      } else {
+        weather = (p0_ema < 1005.0f ? "Dull" : "Cloudy");
+      }
+    }
+    
+    Serial.println("Weather calculated: " + weather);
+    delay(2000); // Пересчитываем каждые 2 секунды
+  }
+} weather_task;
+
+class WebServerTask : public LeanTask {
+public:
+  void loop() {
+    WiFiClient client = server.available();
+    if (client) {
+      String request = client.readStringUntil('\r');
+      Serial.print("request: ");
+      Serial.println(request);
+      client.flush();
+      client.print(getResponse());
+    }
+    delay(50); 
+  }
+} webserver_task;
+
 void setup() {
   Serial.begin(115200);
   
@@ -83,67 +190,18 @@ void setup() {
   Serial.print(WiFi.localIP());
   
   server.begin();
+
+  Scheduler.start(&bme280_task);
+  Scheduler.start(&pressure_task);
+  Scheduler.start(&light_task);
+  Scheduler.start(&rain_task);
+  Scheduler.start(&weather_task);
+  Scheduler.start(&webserver_task);
+
+  Scheduler.begin();
 }
 
 void loop() {
-  WiFiClient client = server.available();
-  if (client) {
-    getMeasurements();
-    String request = client.readStringUntil('\r');
-    Serial.print("request: ");
-    Serial.println(request);
-    client.flush();
-    client.print(getResponse());
-    delay(1000);
-  }
-}
-
-void getMeasurements() {
-  temperature = bme.readTemperature();          // °C
-  humidity    = bme.readHumidity();             // %
-  pressure    = bme.readPressure() / 100.0F;    // hPa
-  altitude    = bme.readAltitude(SEALEVELPRESSURE_HPA); // m
-  light       = 1024 - analogRead(lightAnalog); // Lux
-  rain        = digitalRead(rainDigital);
-  isRainy     = rain < 1.00;               
-
-  seaLevelPressure = toSeaLevelPressure(pressure, ELEVATION_M);
-  if (isnan(p0_ema)) p0_ema = seaLevelPressure;
-  p0_ema += ALPHA_P * (seaLevelPressure - p0_ema);
-
-  if (isnan(p0_mark) || (millis() - lastTrendMark) > TREND_WINDOW_MS) {
-    p0_mark = p0_ema;
-    lastTrendMark = millis();
-  }
-  float dP = p0_ema - p0_mark;
-  
-  float Td = dewPointC(temperature, humidity);
-  float spread = temperature - Td;
-
-  if (isRainy) {
-    if (temperature < 0.0f) {
-      weather = (light < LIGHT_NIGHT) ? "Snow (night)" : "Snow";
-    } else {
-      weather = (light < LIGHT_NIGHT) ? "Rain (night)" : "Rain";
-    }
-    if (p0_ema < 1000.0f || dP < -1.0f) weather += " • weather will be worse";
-  }
-    
-  else if ((humidity >= 95.0f || spread < 2.0f) && light < 600) {
-    weather = "Fog";
-  }
-    
-  else {
-    if (light >= LIGHT_SUNNY && p0_ema >= 1018.0f) {
-      weather = "Sunny";
-    } else if (light >= LIGHT_DAY) {
-      weather = (p0_ema >= 1010.0f ? "Partly cloudy" : "Cloudy");
-    } else if (light < LIGHT_NIGHT) {
-      weather = "Night";
-    } else {
-      weather = (p0_ema < 1005.0f ? "Dull" : "Cloudy");
-    }
-  }
 }
 
 String getResponse() {
@@ -249,6 +307,3 @@ String getResponse() {
   ptr += "</html>";
   return ptr;
 }
-
-
-
